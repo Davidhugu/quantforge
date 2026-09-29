@@ -224,3 +224,98 @@ def test_exec_demo_verbose_runs_end_to_end(capsys):
     assert "Power:" in out
     assert "CAVEAT on the router rows" in out
     assert "lit-only schedule comparisons" in out
+
+
+def test_exogenous_path_advances_on_every_bar_even_when_a_slice_is_zero(monkeypatch):
+    """A bar we size zero still happened: the market moved through it, and the
+    order is marked against that market.
+
+    Regression: the zero-slice `continue` skipped `px_exo += path.dw[i]`, so
+    from that bar onward every fill was priced against a stale benchmark and
+    the drift bucket under-charged the move the strategy actually sat through.
+    Unreachable from the shipped schedules (w > 0 everywhere and
+    fc_clipped >= 0.5), so this forces it with a hand-built schedule and a path
+    whose only real move is on the skipped bar.
+    """
+    import exec_algos as E
+    B = 4
+    w = np.array([1.0, 0.0, 1.0, 0.5])
+    W = np.cumsum(w[::-1])[::-1]                     # remaining weight per bar
+    monkeypatch.setitem(E._SCHED, (B, 3.0), (w, W))
+    ones = np.ones(B)
+    path = E.Path(dw=np.array([0.0, 0.05, 0.0, 0.0]), vol_real=ones, vol_fc=ones,
+                  sig=0.0, barvol=np.full(B, 1e12), fc_clipped=ones)
+    res = E.parent_order("IS-adaptive", path, np.random.default_rng(0), B=B)
+    # sig = 0 isolates drift: bar 0 takes 1/2.5 of the book at the arrival
+    # price, bar 1 is skipped, bar 2 takes 1/1.5 of the remainder (0.4 of the
+    # book) and bar 3 the last 0.2 -- both marked 0.05 above arrival
+    assert res["drift"] == pytest.approx(0.6 * 0.05 / ARRIVAL * 1e4, abs=1e-9)
+    assert res["filled"] == pytest.approx(SHARES, rel=1e-9)
+    assert res["impact"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_router_caveat_quotes_its_fee_table_in_bps_not_dollars(capsys):
+    """The caveat transcribed SHAPE's fee literals as "1.0 vs 3.0 bp".
+
+    They are $/share -- `parent_order` adds them to a price -- so the run's own
+    fee column says 0.1 and 0.3. A 10x error in the one sentence whose job is to
+    stop the reader quoting this study as a discovered edge.
+    """
+    import re
+
+    import exec_algos as E
+    exec_demo(n=5, verbose=True)
+    out = capsys.readouterr().out
+    caveat = out[out.index("CAVEAT on the router rows"):]
+    got = re.search(r"\(([\d.]+) vs ([\d.]+) bp fee", caveat)
+    assert got, caveat[:300]
+    dark, lit = float(got.group(1)), float(got.group(2))
+    assert lit == pytest.approx(Router.SHAPE["lit"][2] / ARRIVAL * 1e4, abs=0.05)
+    assert dark == pytest.approx(Router.SHAPE["dark"][2] / ARRIVAL * 1e4, abs=0.05)
+    # and the prose agrees with the number the table reports
+    lit_only = exec_demo(n=5, verbose=False)["TWAP (lit only)"]
+    assert lit_only["fee"] == pytest.approx(lit, abs=1e-6)
+
+
+# ------------------------------------------------------------------ degenerate sample
+def test_exec_demo_refuses_fewer_than_two_paths():
+    """n=1 printed a full report in which every paired contrast came back
+    t = +-inf and starred -- the strongest possible verdict off a single draw --
+    and then raised ValueError in the power block, because a per-path sd cannot
+    be estimated from one observation. n=0 divided by zero. Both were reachable
+    from the CLI as `exec --exec-n 1` and `--exec-n 0`."""
+    for n in (0, 1, -5):
+        with pytest.raises(ValueError, match="at least 2"):
+            exec_demo(n=n)
+    # 2 paths is the smallest run that can say anything, and it must work
+    assert len(exec_demo(n=2, verbose=False)) == 6
+
+
+def test_power_line_reports_rather_than_raising_on_a_degenerate_effect():
+    """The whole point of `_power_line` is to handle a point estimate that has
+    collapsed toward zero. It used to raise on exactly that input: `x ** 2`
+    overflows (OverflowError) for a finite x whose square is not representable,
+    and `int(inf)` raises too. A guard that crashes on the case it exists to
+    describe is worse than no guard."""
+    import exec_algos as E
+    for delta in (0.0, 1e-12, 1e-160, 5e-324, -1e-300):
+        txt = E._power_line({"delta": delta}, sd=40.0, n=60)
+        assert "indistinguishable from zero" in txt, delta
+
+    # a non-finite per-path sd is what n=1 produced; it must degrade to the same
+    # message rather than taking the report down
+    for sd in (float("nan"), float("inf")):
+        txt = E._power_line({"delta": 0.5}, sd=sd, n=60)
+        assert "indistinguishable from zero" in txt, sd
+
+    # and a real, resolvable effect must still be described as resolvable
+    txt = E._power_line({"delta": -2.0}, sd=40.0, n=60)
+    assert "n = 1,600" in txt and "UNDERPOWERED" in txt
+
+
+def test_exec_demo_at_n_is_not_significant_on_one_path():
+    """Guards the interaction between the two fixes: even if a caller gets a
+    single path past exec_demo's own check, paired() must not promote it."""
+    from stats import paired
+    p = paired([1.0], [1.5])
+    assert p["t"] == 0.0 and p["sig"] is False

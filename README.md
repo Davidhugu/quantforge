@@ -47,7 +47,9 @@ python flow_mm.py all                       # all three, in order
 
 Useful flags: `--workers N` (0 = auto, `cpu_count - 1`), `--alpha-std`,
 `--informed-rate` to override market calibration from the shell, `--exec-n` for
-path count, `--out` for the sweep CSV.
+path count, `--out` for the sweep CSV. Counts are validated at the parser, so
+`--days 0` or `--exec-n 1` is a one-line usage error rather than a run that
+quietly substitutes a default.
 
 `backtest` is the cheapest way in — a 1-day run takes about 8 seconds and a
 3-day run about 20 (seconds of wall clock, five rungs per session), and prints
@@ -142,7 +144,7 @@ cancels.
 | File | Contents |
 | --- | --- |
 | `sweep.csv` | one row per grid point: PnL per rung, paired deltas/t/win/CI, fills, informed share, drawdown, PnL/DD. |
-| `audit_log.jsonl` | append-only event trail for the top rung on seed 0 — fills, hedges, risk rejects (first, 100th, 1000th), throttle transitions, kill switch. Each record carries a real wall clock and a sim-time field. |
+| `audit_log.jsonl` | per-run event trail for the **last** rung of the ladder (`+ hedging (full)`) on seed 0 — fills, hedges, risk rejects (first, 100th, 1000th), throttle transitions, kill switch. Each record carries a real wall clock, a sim-time field, and the rung in `run`. The file is rewritten on each run, not appended to. |
 | `equity.png` | mean cumulative PnL path per rung. |
 
 A worked example of the latter two is committed under `baseline/`.
@@ -150,15 +152,26 @@ A worked example of the latter two is committed under `baseline/`.
 ## Tests
 
 ```bash
-python -m pytest -q      # 71 tests, ~65 s
+python -m pytest -q      # 102 tests, ~1 min
 ```
 
 Coverage is behavioural rather than incidental: RLS against a closed-form least
 squares solution and across a regime shift; the running-sum VPIN against a naive
 one; market fill intensity against the intensity formula; the PnL identity;
 common-random-number and no-look-ahead properties of the execution study;
-router non-degeneracy; a fast path proven equivalent to its general path; and
-parallel-vs-serial backtest agreement in both chunking regimes.
+router non-degeneracy; a fast path proven equivalent to its general path;
+parallel-vs-serial backtest agreement in both chunking regimes; and one test per
+report number a reader could otherwise be misled by — the fee units, the
+breakeven sign, which rung the audit trail belongs to, and the CLI refusing
+counts too small to mean anything.
+
+Two more are worth calling out because they guard prose rather than numbers. The
+ablation report's NOTE paragraph is rung-aware: it used to describe every losing
+rung as paying "0 of futures PnL against 0 of cost", which is nonsense for a
+`hedge=False` config — reachable through the `ladder=` argument. And the
+interaction block reads both of its axes out of `GRID` instead of a private copy
+of them, so editing the grid cannot leave the cross term describing a grid that
+no longer exists.
 
 ## Project layout
 
@@ -169,7 +182,6 @@ analysis.py     sensitivity sweep and the interaction block
 stats.py        paired statistics, no scipy
 tests/          pytest suite
 ```
-
 ## Known limitations
 
 The code refers back to this section; these are not hedges, they are the
@@ -179,10 +191,10 @@ boundary of what the harness measures.
    no queue position, no exchange latency, no order-book replenishment, and no
    genuine adverse-selection dynamics. Anything about queue effects or
    fill-probability realism is out of scope.
-2. **The sim is generous.** The reported breakeven fee lands orders of magnitude
-   above the real ~0.3 bps exchange fee. The harness prints that caveat itself:
-   a large breakeven means the environment is easy, not that the strategy is
-   good.
+2. **The sim is generous.** The reported breakeven fee is about 8x the real
+   ~0.3 bps exchange fee. The harness computes and prints that ratio rather
+   than asserting it, because a breakeven well above the real fee means the
+   environment is easy, not that the strategy is good.
 3. **The sweep is one-at-a-time, not factorial.** A full factorial over these
    factors costs orders of magnitude more than one backtest and does not fit in a
    terminal. Only the `alpha_std × informed_horizon` interaction is measured
@@ -203,9 +215,14 @@ boundary of what the harness measures.
 8. **Paired t-statistics are within-path.** Seeds are shared across rungs, so the
    tests describe this synthetic market, not a population of real ones. No
    parameter uncertainty is propagated into the intervals.
-9. **`adverse` is a memo line, not a PnL term.** It is the 30-second markout of
-   fills, a diagnostic sub-view of `inv_drift`, and is deliberately excluded from
-   the additive decomposition to avoid double counting.
+9. **`adverse` is a memo line, not a PnL term.** It is the 30-second move in the
+   mid after each fill, signed so positive means the market went against us. It
+   is the *negation* of the per-fill contribution to `inv_drift` and the
+   sign-flip of the markout (per fill `mo == spread_c - adverse_c`), and is
+   excluded from the additive decomposition to avoid double counting. Note the
+   units differ: `spread` and `adverse` are dollars, `mo_b`/`mo_i` are basis
+   points per share. It is also computed and aggregated but never printed or
+   written, so it is currently a dead diagnostic.
 
 ## License
 

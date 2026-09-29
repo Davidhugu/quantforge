@@ -58,25 +58,52 @@ SESSION = 23_400  # seconds in a US equity session
 H_SIG = 30  # signal / holding / markout horizon, seconds
 TAPE_MAX = 8  # max background arrivals modelled per second
 
+REAL_EXCHANGE_FEE_BPS = 0.3  # ~0.3 bp of notional, for the breakeven comparison
+
+
+def bps_per_share(fee_ps: float, px: float) -> float:
+    """$/share -> basis points of notional, i.e. `fee_ps / px * 1e4`.
+
+    `exec_algos.parent_order` divides by the reference price for exactly this
+    reason. Multiplying by 1e4 alone treats a dollar as the unit of account and
+    reports a $100 stock's fee 100x too large, which is how `--fee 0.003` -- a
+    realistic 0.3 bp -- was printed as 30 bp.
+    """
+    return fee_ps / px * 1e4
+
 
 # ============================================================ calibration diagnostics
-def calibration(p: "MarketParams") -> dict:
+def calibration(p: "MarketParams", ds=None) -> dict:
     """Derived statistics that decide whether the sim can test anything.
 
     `predictable_share` is the fraction of H-step return variance explained by
     the best possible state read. If this is ~0, the signal layer is untestable;
     if the informed edge is dwarfed by the spread, there is no adverse
     selection to defend against. Both were broken in the original defaults.
+
+    With `ds` (a replayed recording) the volatility is measured from the data
+    instead of read off `sigma_ann`, and the two state-dependent statistics are
+    reported as None. A recording has no latent drift and no `alpha_*` to it,
+    so those numbers are not "small" -- they are undefined, and printing a
+    plausible-looking figure for them next to a real-data PnL is how a result
+    ends up quietly meaning nothing.
     """
-    sig = p.sigma_ann * p.s0 / math.sqrt(252 * p.steps)
     h = p.informed_horizon
+    if ds is not None:
+        mid = np.asarray(ds.frames["mid"], dtype=float)
+        r = np.diff(np.log(mid[mid > 0])) if len(mid) > 1 else np.zeros(1)
+        sig = float(r.std()) if len(r) else 0.0
+        return dict(sig=sig, var=sig ** 2, pred_h=None, noise_h=None,
+                    predictable_share=None, edge_sd=None, source=ds.meta.get("venue", "replay"))
+
+    sig = p.sigma_ann * p.s0 / math.sqrt(252 * p.steps)
     gain = sum(p.alpha_phi ** j for j in range(h))  # E[a_{t+h} | a_t], summed
     pred = gain * p.alpha_std  # predictable component of the H-step return
     noise = math.sqrt(h) * sig  # diffusion over the same horizon
     share = pred ** 2 / (pred ** 2 + noise ** 2) if (pred or noise) else 0.0
     # the informed trader's expected edge if fully filled at the touch
     return dict(sig=sig, var=sig ** 2, pred_h=pred, noise_h=noise,
-                predictable_share=share, edge_sd=pred)
+                predictable_share=share, edge_sd=pred, source="synthetic-market")
 
 
 # ============================================================ synthetic market
@@ -171,9 +198,14 @@ class Market:
         """Every client arrival at second `t`, and what we would charge for it.
 
         bb/ab and bi/ai are our bid/ask for the benign and informed client
-        tiers; either side may be None (not quoted). Returns (side, kind, px),
-        with px=None meaning the client arrived and we had nothing to show
-        them -- those still count as market-wide volume for the toxicity filter.
+        tiers; either side may be None (not quoted). Returns (side, kind, px).
+
+        An arrival is only reported when we have a quote to show the client:
+        every branch is guarded on the price being not None, so a second with no
+        quotes returns []. The caller therefore never sees an unquoted arrival
+        here, and the toxicity filter is fed from the exogenous tape (see
+        `Market.tapel`) rather than from anything here -- feeding it our fills
+        would make the estimate a function of our own quoting.
         """
         p, S, u, prof = self.p, self.Sl[t], self.Ul[t], self.profl[t]
         A, k = p.A * prof, p.k
@@ -258,7 +290,8 @@ class RLS:
 class Toxicity:
     """VPIN-style: mean |buy-sell|/volume over recent equal-volume buckets.
 
-    Fed the exogenous market tape (see Market.tape), not our fills.
+    Fed the exogenous market tape (`Market.tapel`, consumed in run_day), not our
+    fills.
     """
 
     def __init__(self, bucket: int = 1000, n: int = 20, warm: int = 5):
@@ -288,7 +321,13 @@ class Toxicity:
 
 # ============================================================ risk & compliance
 class Audit:
-    """Append-only JSONL trail with a real wall clock plus a sim-time field."""
+    """Per-run JSONL trail with a real wall clock plus a sim-time field.
+
+    Opened with "w", so each run starts the file clean rather than appending to
+    a previous one. Records are self-identifying via `run`, and a run that
+    doubled up on one path would interleave two markets in one file, which is
+    worse than losing the old copy.
+    """
 
     def __init__(self, path: str, run_id: str):
         self.f = open(path, "w")
@@ -304,20 +343,17 @@ class Audit:
 
 class TokenBucket:
     """Message-rate governor. The old counter compared a 1-second delta against
-    a per-second cap, which a 1-update-per-second strategy can never breach."""
+    a per-second cap, which a 1-update-per-second strategy can never breach.
+
+    There is deliberately no `take()` here: the hot path in `Engine.quotes`
+    inlines the same refill-and-spend so it can also count only *published*
+    sends toward `peak` and republish the held book when the bucket is dry. A
+    second entry point would have to duplicate that, and the two would drift.
+    """
 
     def __init__(self, rate: float, burst: float):
         self.rate, self.burst, self.tok, self.t = rate, burst, burst, 0.0
         self.peak = 0.0
-
-    def take(self, t: int, n: int) -> bool:
-        self.tok = min(self.burst, self.tok + (t - self.t) * self.rate)
-        self.t = t
-        self.peak = max(self.peak, n)
-        if self.tok >= n:
-            self.tok -= n
-            return True
-        return False
 
 
 @dataclass
@@ -433,11 +469,12 @@ class Engine:
         self.alpha_mu, self.alpha_var, self.alpha_last = 0.0, 1e-12, 0.0
         self.buf: deque = deque()  # (I, lead, S) delayed by the holding horizon
         # invariant across the session; recomputing these per step was ~15% of
-        # the whole backtest
+        # the whole backtest. (the toxicity rail is bounded by tox_floor, so
+        # its max is c.tox_coef * (1 - c.tox_floor) -- not worth caching, it is
+        # read once per side and the spread maths around it dominates)
         self._kterm = math.log(1 + c.gamma / c.k) / c.gamma
         self._vterm = 0.5 * c.gamma * c.tau
         self._skew = c.gamma * c.tau
-        self._toxmax = c.tox_coef * (1.0 - c.tox_floor)
 
     def _alpha(self, I: float, F: float, S: float) -> float:
         """Predicted H-step return, clipped at `alpha_clip` running sigmas.
@@ -540,9 +577,15 @@ def run_day(m: Market, c: Cfg, audit: Audit | None = None) -> dict:
         pnl = spread + inv_drift + hedge_pnl - fees - hedge_cost - flatten
 
     which follows from summation by parts on the two inventory books and is
-    asserted in tests/test_engine.py. `adverse` below is a memo line: it is the
-    H-step markout of the fills, a diagnostic sub-view of `inv_drift`, not an
-    additional term.
+    asserted in tests/test_engine.py. `adverse` below is a memo line, not a term
+    in that identity: it is the H-step move in the mid after each fill, signed
+    so that positive means the market went against us (a client who bought from
+    us and then saw the mid rise). It is the NEGATION of the per-fill
+    contribution to `inv_drift`, and the sign-flip of the markout -- per fill
+    `mo == spread_c - adverse_c`, since (px - S) - (far - S) == (px - far). It
+    is a diagnostic on the same events, not a sub-view of `inv_drift` itself, and
+    it is not additive. Mind the units: `spread` and `adverse` are dollars, but
+    the reported `mo_b`/`mo_i` are basis points per share.
     """
     T = m.p.steps
     e = Engine(c, m.p, audit)
@@ -625,7 +668,12 @@ def run_day(m: Market, c: Cfg, audit: Audit | None = None) -> dict:
             flatten = c.flatten_cost * (abs(inv) + abs(hed))
             cash += inv * S1 + hed * F1 - flatten
             inv = hed = 0
-            for u in range(t + 2, T + 1):
+            # from t+1, not t+2: the liquidation happens AT t, so curve[t+1] is
+            # the post-flatten cash. Backfilling from t+2 left the flatten cost
+            # showing up as a one-second crash with no event behind it, and when
+            # the kill fired on the final step (range(t+2, T+1) empty) dropped
+            # the cost from the curve entirely.
+            for u in range(t + 1, T + 1):
                 curve[u] = cash
             break
         e.learn(Il[t], (Fl[t] - S) * 50.0, S)
@@ -634,7 +682,12 @@ def run_day(m: Market, c: Cfg, audit: Audit | None = None) -> dict:
             if len(awin) > H_SIG:
                 a0, S0 = awin.popleft()
                 y = S - S0
-                o = m.al[t] * gain             # best forecast of y given the state
+                # The state must be read at the START of the window. `a0` was
+                # predicted at S0 = Sl[t-H_SIG], so the best forecast available
+                # then is a[t-H_SIG]*gain; using a[t] is a look-ahead of the full
+                # horizon and reported a ceiling below the one that actually
+                # bounds the estimator. gain is the same sum calibration() uses.
+                o = m.al[t - H_SIG] * gain
                 n_a += 1
                 sa += a0; sy += y; saa += a0 * a0; say += a0 * y; syy += y * y
                 so += o; soo += o * o; soy += o * y
@@ -709,6 +762,12 @@ def backtest(days: int = 30, audit_path: str | None = None, plot: str | None = N
              ladder=None, quiet: bool = False, markets=None, workers: int = 1) -> dict:
     mp = mp or MarketParams()
     ladder = list(ladder or LADDER)
+    # days=0 used to split on `workers`: the serial path raised IndexError, while
+    # the parallel path ran seed 0 anyway and reported a full ladder under a
+    # "0 paired sessions" header. A session count of zero is a mistake, and
+    # returning data for it is worse than refusing.
+    if days < 1:
+        raise ValueError(f"days must be >= 1, got {days}")
 
     if markets is not None or workers == 1:
         mkts = markets or [Market(mp, s) for s in range(days)]
@@ -753,7 +812,11 @@ def backtest(days: int = 30, audit_path: str | None = None, plot: str | None = N
                             slots[i].append(r)       # res[i] is one day's dict
         rows_by_cfg = slots
 
-    cal = calibration(mp)
+    # only the serial path builds markets in-process; the parallel path
+    # reconstructs them per task, so a replayed run has no single dataset to
+    # measure calibration from and falls back to the declared parameters
+    cal = calibration(mp, ds=getattr(mkts[0], "ds", None)
+                      if (markets is not None and workers == 1 and mkts) else None)
     agg, pnl_by_cfg, curves = {}, {}, {}
     for c, rows in zip(ladder, rows_by_cfg):
         agg[c.name] = _mean_agg(rows)
@@ -777,11 +840,21 @@ def _day_rows_args(a):
 def _report(cal, mp, ladder, pnl_by_cfg, agg, days, cfg_fee, audit_path,
             dd_rows=None) -> None:
     dd_rows = dd_rows or {}
-    print(f"\nSynthetic-market ablation: {days} paired sessions, 1 lot = {LOT} sh, "
-          f"1 tick = ${TICK}, fee = {cfg_fee * 1e4:+.2f} bps/share")
-    print(f"  derived: sigma/s = {cal['sig'] * 1e4:.1f} bps | predictable share of the "
-          f"{mp.informed_horizon}s return = {cal['predictable_share'] * 100:.1f}% | "
-          f"H-step drift sd = {cal['pred_h'] * 100:.2f}c\n")
+    src = cal.get("source", "synthetic-market")
+    replay = src != "synthetic-market"
+    print(f"\n{'Replayed-data' if replay else 'Synthetic-market'} ablation: {days} paired "
+          f"sessions{f' from {src}' if replay else ''}, 1 lot = {LOT} sh, "
+          f"1 tick = ${TICK}, fee = {bps_per_share(cfg_fee, mp.s0):+.2f} bps/share")
+    na = "n/a"
+    ps = f"{cal['predictable_share'] * 100:.1f}%" if cal["predictable_share"] is not None else na
+    ph = f"{cal['pred_h'] * 100:.2f}c" if cal["pred_h"] is not None else na
+    print(f"  derived: sigma/s = {cal['sig'] * 1e4:.1f} bps"
+          f"{' (measured from the recording)' if replay else ''} | predictable share of "
+          f"the {mp.informed_horizon}s return = {ps} | H-step drift sd = {ph}\n")
+    if replay:
+        print("  predictable share and H-step drift are undefined for a recording: there\n"
+              "  is no latent state to hand an oracle. The alpha correlation below is\n"
+              "  still measured -- it is the only honest test of the signal layer.\n")
     hdr = (f"{'config':<22}{'PnL/day $':>10}{'sem':>8}{'maxDD $':>9}{'PnL/DD':>8}"
            f"{'avg|inv|':>9}"
            f"{'fills':>7}{'inf%':>6}{'spread$':>9}{'invDrift$':>10}{'hedge$':>8}"
@@ -828,39 +901,91 @@ def _report(cal, mp, ladder, pnl_by_cfg, agg, days, cfg_fee, audit_path,
               f"is a risk/PnL trade rather than a defect.")
         print(f"        The PnL/DD column is the point: max drawdown moves "
               f"{b['dd']:,.0f} -> {a['dd']:,.0f}")
-        print(f"        (t = {ddt:.1f} on the paired difference) while avg|inv| moves "
-              f"{b['avg_inv']:,.0f} -> {a['avg_inv']:,.0f} and the hedge books")
-        print(f"        {a['hedge_pnl']:,.0f} of futures PnL against "
-              f"{a['hedge_cost']:,.0f} of cost. The skew already controls net delta, "
-              f"so the")
-        print(f"        hedge mostly pays to carry MORE gross inventory. It is a "
-              f"drawdown control, and")
-        print(f"        a poor one unless the drawdown matters more than the PnL.\n")
+        if c.hedge:
+            # Only hedge the hedging rung. This paragraph used to be emitted
+            # unconditionally, so a non-hedging rung that lost to the rung below
+            # got told it "books 0 of futures PnL against 0 of cost" and that
+            # "the hedge pays to carry MORE gross inventory" -- describing a leg
+            # it does not have. Reachable via `ladder=`, which tests and the
+            # tox sweep both pass.
+            print(f"        (t = {ddt:.1f} on the paired difference) while avg|inv| "
+                  f"moves {b['avg_inv']:,.0f} -> {a['avg_inv']:,.0f} and the hedge "
+                  f"books")
+            print(f"        {a['hedge_pnl']:,.0f} of futures PnL against "
+                  f"{a['hedge_cost']:,.0f} of cost. The skew already controls net "
+                  f"delta, so the")
+            print(f"        hedge mostly pays to carry MORE gross inventory. It is a "
+                  f"drawdown control, and")
+            print(f"        a poor one unless the drawdown matters more than the "
+                  f"PnL.\n")
+        else:
+            # No futures leg, so no hedge story to tell. Report the risk
+            # quantities this rung actually moved, all present in `_NUMERIC`.
+            print(f"        (t = {ddt:.1f} on the paired difference) while avg|inv| "
+                  f"moves {b['avg_inv']:,.0f} -> {a['avg_inv']:,.0f} and peak "
+                  f"inventory moves")
+            print(f"        {b['max_inv']:,.0f} -> {a['max_inv']:,.0f}. This rung "
+                  f"trades no derivative, so the loss buys nothing in the way of "
+                  f"carry: it is paid in")
+            print(f"        wider quotes, a throttler that peaked at "
+                  f"{a['peak_rate']:,.0f} msgs/s, and "
+                  f"{int(a['killed'])} kill switch{'es' if a['killed'] != 1 else ''}"
+                  f" over the session.")
+            print(f"        Worth keeping only if that quote width and throttle "
+                  f"headroom are worth more than the PnL.\n")
 
     if len(ladder) > 2:
         sig = agg[ladder[2].name]
         print(f"  signal value: corr(predicted {mp.informed_horizon}s return, realised) = "
-              f"{sig['alpha_corr']:+.3f};  oracle corr given the true state = "
-              f"{sig['oracle_corr']:+.3f}.")
-        print("  The gap is what the imbalance and futures-lead features throw away in "
-              "measurement\n  noise. The oracle is the ceiling: no estimator on these "
-              "features can beat it.\n")
+              f"{sig['alpha_corr']:+.3f}"
+              f"{';  oracle corr n/a -- a recording has no latent state to read.' if replay else ';  oracle corr given the true state at prediction = ' + format(sig['oracle_corr'], '+.3f') + '.'}")
+        if not replay:
+            print("  The gap is what the imbalance and futures-lead features throw away in "
+                  "measurement\n  noise. The oracle is the ceiling: no estimator on these "
+                  "features can beat it,\n  and it is read at the same instant the prediction "
+                  "was made, so it is a fair one.\n")
+        else:
+            print("  This is the only honest test of the signal layer available on a\n"
+                  "  recording: it is measured, not inferred from a ceiling we cannot\n"
+                  "  construct. A near-zero correlation means no estimator built on\n"
+                  "  these features is worth much, not merely that this one failed.\n")
 
     best = max(ladder, key=lambda c: summarize(pnl_by_cfg[c.name])["mean"])
     a = agg[best.name]
     gross = (a["spread"] + a["inv_drift"] + a["hedge_pnl"]
              - a["hedge_cost"] - a["flatten"])
     nsh = a["fills"] * LOT
+    # The breakeven is a COST, so it carries the sign of the gross: positive
+    # when the strategy earns more than it pays in fees. It used to be negated
+    # and scaled by 1e4, which printed "-229 bps/share" for a strategy that
+    # clears a 2.3 bp fee, and the sentence underneath it then claimed the
+    # number was "far above" a positive fee. Both halves had to move together.
+    breakeven = bps_per_share(gross / max(1.0, nsh), mp.s0)
     print(f"  best rung: {best.name}")
     print(f"  gross before fees = {gross:,.0f} $/day on {nsh:,.0f} shares "
-          f"-> breakeven fee = {-gross / max(1.0, nsh) * 1e4:+.2f} bps/share")
+          f"-> breakeven fee = {breakeven:+.2f} bps/share "
+          f"(${breakeven / 1e4 * mp.s0:+.4f}/sh)")
+    if breakeven <= 0:
+        verdict = ("this rung loses money before fees, so the breakeven is a "
+                   "rebate it would have to be paid to break even")
+    elif breakeven > REAL_EXCHANGE_FEE_BPS:
+        verdict = (f"{breakeven / REAL_EXCHANGE_FEE_BPS:.0f}x the real "
+                   f"~{REAL_EXCHANGE_FEE_BPS} bps exchange fee; a breakeven above "
+                   f"the real\n  fee means the sim is generous, not that the "
+                   f"strategy is good")
+    else:
+        verdict = (f"below the real ~{REAL_EXCHANGE_FEE_BPS} bps exchange fee, "
+                   f"so the edge does\n  not clear a realistic transaction cost")
+    cap = verdict[0].upper() + verdict[1:]
     if a["pnl"]:
         print(f"  of which alpha (inv_drift) = {a['inv_drift'] / a['pnl']:+.0%} of net PnL; "
-              f"spread capture = {a['spread'] / a['pnl']:+.0%}. A breakeven fee far above\n"
-              f"  the real 0.3 bps exchange fee means the sim is generous, not that the "
-              f"strategy is good.")
+              f"spread capture = {a['spread'] / a['pnl']:+.0%}. {cap}.")
+    else:
+        print(f"  {cap}.")
     if audit_path:
-        print(f"  audit trail ({best.name}, seed 0) -> {audit_path}")
+        # the audited rung is ladder[-1] (see backtest), which is NOT
+        # necessarily the best-PnL rung printed above
+        print(f"  audit trail ({ladder[-1].name}, seed 0) -> {audit_path}")
 
 
 def _plot(path: str, curves: dict, days: int) -> None:
@@ -887,20 +1012,41 @@ def _workers(n: int) -> int:
     return max(1, (os.cpu_count() or 1) - 1)
 
 
+def _at_least(flag: str, minimum: int):
+    """argparse `type` that refuses a count too small to mean anything.
+
+    The library entry points raise on these inputs too, but a raw ValueError
+    from four frames down is a traceback, not an interface. Validating here
+    turns `--days 0` and `--exec-n 1` into a one-line error and exit 2.
+    """
+    def parse(v):
+        try:
+            n = int(v)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{flag} must be an integer, got {v!r}")
+        if n < minimum:
+            raise argparse.ArgumentTypeError(f"{flag} must be >= {minimum}, got {n}")
+        return n
+    return parse
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(prog="quantforge",
                                  description=__doc__.split("\n")[1])
     ap.add_argument("mode", choices=["backtest", "exec", "sweep", "all"], nargs="?",
                     default="all")
-    ap.add_argument("--days", type=int, default=None,
+    ap.add_argument("--days", type=_at_least("--days", 1), default=None,
                     help="paired sessions per config (backtest default 30, "
-                         "sweep default 10). Takes precedence over --seeds.")
+                         "sweep default 10). Takes precedence over --seeds. "
+                         "Must be >= 1: a run of zero sessions reports no "
+                         "variance and is refused, not defaulted.")
     ap.add_argument("--fee", type=float, default=0.0,
                     help="per-share fee, positive = cost (default 0)")
-    ap.add_argument("--audit", default=None, help="write a JSONL trail for the top rung")
+    ap.add_argument("--audit", default=None,
+                    help="write a JSONL trail for the last ladder rung on seed 0")
     ap.add_argument("--plot", default=None, help="write the mean-PnL path as a PNG")
     ap.add_argument("--out", default="sweep.csv", help="sweep output path")
-    ap.add_argument("--seeds", type=int, default=10,
+    ap.add_argument("--seeds", type=_at_least("--seeds", 1), default=10,
                     help="sweep: sessions per grid point. Alias for --days, "
                          "which wins if both are given. Having two flags for "
                          "one quantity is a trap: --days used to be silently "
@@ -909,12 +1055,15 @@ def main(argv=None) -> None:
                     help="override MarketParams.alpha_std ($/sec of latent drift)")
     ap.add_argument("--informed-rate", type=float, default=None,
                     help="override MarketParams.informed_rate")
-    ap.add_argument("--exec-n", type=int, default=None,
+    ap.add_argument("--exec-n", type=_at_least("--exec-n", 2), default=None,
                     help="exec: common paths (default 3000; the IS-vs-TWAP "
                          "contrast needs ~30k to resolve, so the demo is "
-                         "deliberately underpowered and says so)")
-    ap.add_argument("--workers", type=int, default=0,
-                    help="parallel worker processes (0 = auto, 1 = serial)")
+                         "deliberately underpowered and says so). Must be >= 2: "
+                         "one path carries no information about a mean.")
+    ap.add_argument("--workers", type=_at_least("--workers", 0), default=0,
+                    help="parallel worker processes (0 = auto, 1 = serial). "
+                         "Negative is refused rather than folded into auto, "
+                         "which is what a truthiness check would do with it.")
     a = ap.parse_args(argv)
     if a.mode in ("backtest", "all"):
         from dataclasses import replace as _replace
@@ -923,8 +1072,8 @@ def main(argv=None) -> None:
             mp = _replace(mp, alpha_std=a.alpha_std)
         if a.informed_rate is not None:
             mp = _replace(mp, informed_rate=a.informed_rate)
-        backtest(a.days or 30, a.audit, a.plot, cfg_fee=a.fee, mp=mp,
-                 workers=_workers(a.workers))
+        backtest(a.days if a.days is not None else 30, a.audit, a.plot,
+                 cfg_fee=a.fee, mp=mp, workers=_workers(a.workers))
     if a.mode in ("exec", "all"):
         from exec_algos import exec_demo
         if a.exec_n is not None:
@@ -933,7 +1082,11 @@ def main(argv=None) -> None:
             exec_demo()
     if a.mode in ("sweep", "all"):
         from analysis import sweep
-        sweep(days=a.days or a.seeds, out=a.out, workers=_workers(a.workers))
+        # `is not None`, not `or`: 0 is falsy, so `--days 0` used to fall
+        # through to the default and quietly run 10 grid points under a header
+        # asking for none.
+        sweep(days=a.days if a.days is not None else a.seeds, out=a.out,
+              workers=_workers(a.workers))
 
 
 if __name__ == "__main__":

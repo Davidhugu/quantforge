@@ -87,3 +87,43 @@ def test_paired_carries_delta_for_the_report_table():
     assert p["delta"] == p["mean"]
     # a deterministic difference is the strongest possible result, not a crash
     assert math.isinf(p["t"]) and p["sig"] is True
+
+
+# ------------------------------------------------------------------ degenerate input
+def test_summarize_rejects_an_empty_series():
+    """The mean of nothing is not zero, and a plausible-looking dict full of
+    zeros is worse than a loud failure. Used to raise ZeroDivisionError."""
+    with pytest.raises(ValueError, match="empty"):
+        summarize([])
+    with pytest.raises(ValueError, match="empty"):
+        paired([], [])
+
+
+def test_paired_rejects_unequal_lengths():
+    """`zip` truncated silently and then computed the critical value from the
+    TRUNCATED length, so a rung measured over a different number of sessions
+    than its baseline came back as a confident answer to the wrong question."""
+    with pytest.raises(ValueError, match="equal-length"):
+        paired([1.0, 2.0, 3.0], [1.0, 2.0])
+    with pytest.raises(ValueError, match="equal-length"):
+        paired([1.0], [1.0, 2.0])
+
+
+def test_paired_with_one_observation_is_never_significant():
+    """sem = 0 turned a single draw into t = +-inf and sig = True, so
+    `backtest --days 1` printed every rung starred off one session. One
+    observation cannot distinguish an effect from one that happened to land."""
+    p = paired([1.0], [2.0])
+    assert p["n"] == 1
+    assert p["t"] == 0.0
+    assert p["sig"] is False
+    # and the win rate is still meaningful at n=1 -- it is just not a test
+    assert p["win"] == 1.0
+    assert p["delta"] == 1.0
+
+
+def test_deterministic_difference_still_reports_infinite_t_at_n_ge_2():
+    """The n >= 2 guard must not demote the genuinely deterministic case, which
+    is a real result: every one of n sessions moved the same way."""
+    p = paired([1.0, 2.0, 3.0, 4.0], [2.0, 3.0, 4.0, 5.0])
+    assert math.isinf(p["t"]) and p["sig"] is True

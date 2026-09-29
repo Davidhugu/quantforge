@@ -22,7 +22,7 @@ import csv
 from dataclasses import replace
 
 from flow_mm import LADDER, Market, MarketParams, backtest
-from stats import paired
+from stats import paired, t_crit95
 
 # (field, values). `None` as the field means "sweep the fee", which is a Cfg
 # knob rather than a MarketParams one and travels through cfg_fee instead.
@@ -41,10 +41,26 @@ GRID = [
 
 # the rung whose paired t against the baseline drives the '*' column
 _REF = "+ alpha signal"
+_REF_IDX = [c.name for c in LADDER].index(_REF)
 
 
 def _key(name: str) -> str:
     return name.replace("+ ", "").replace(" ", "_").replace("&", "and").replace("/", "_")
+
+
+def _grid_values(field: str) -> list:
+    """The value list `GRID` declares for `field`.
+
+    The interaction block used to spell out its own copies of the alpha_std and
+    informed_horizon levels, so editing `GRID` changed the one-at-a-time sweep
+    and left the cross term -- and the README table built from it -- describing a
+    grid that no longer existed. Read both from `GRID` instead.
+    """
+    for name, vals in GRID:
+        if name == field:
+            return vals
+    raise KeyError(f"{field!r} is not a swept field in GRID; "
+                   f"have {[n for n, _ in GRID]}")
 
 
 def _interaction(days: int, workers: int) -> list:
@@ -63,13 +79,14 @@ def _interaction(days: int, workers: int) -> list:
     print(f"  {'alpha_std':>10}{'horizon':>9}{'pred%':>7}{'dPrev':>9}{'tPrev':>8}"
           f"{'win':>6}{'inf%':>7}{'PnL full':>10}")
     print("  " + "-" * 68)
-    for a_std in (0.0, 5e-4, 1.2e-3, 2.5e-3):
-        for h in (10, 30, 60):
+    # constant across cells, so resolve them once rather than per cell
+    k = _key(_REF)
+    below_ref = [c.name for c in LADDER][_REF_IDX - 1]
+    for a_std in _grid_values("alpha_std"):
+        for h in _grid_values("informed_horizon"):
             mp = replace(MarketParams(), alpha_std=a_std, informed_horizon=h)
             r = backtest(days=days, mp=mp, quiet=True, workers=workers, ladder=LADDER)
-            k = _key(_REF)
-            i = [c.name for c in LADDER].index(_REF)
-            pp = paired(r["pnl"][LADDER[i - 1].name], r["pnl"][_REF])
+            pp = paired(r["pnl"][below_ref], r["pnl"][_REF])
             top = r["agg"][LADDER[-1].name]
             # same column names as the one-at-a-time grid, so both blocks are
             # directly comparable in the CSV rather than needing a join
@@ -94,12 +111,14 @@ def sweep(days: int = 10, out: str | None = "sweep.csv", quiet: bool = False,
           workers: int = 1) -> list:
     """One-at-a-time sensitivity around the MarketParams defaults.
 
-    One-at-a-time rather than a full factorial: a factorial over these six
-    factors is 144x the cost of one backtest and does not fit in a terminal.
-    The one interaction that matters -- alpha_std against the informed tier's
-    reach -- is measured separately by `_interaction`; see README, Known
-    limitations.
+    One-at-a-time rather than a full factorial: a factorial over the six swept
+    factors is 432x the cost of one backtest (144x over the five MarketParams
+    ones, 1296x including the fee axis) and does not fit in a terminal. The one
+    interaction that matters -- alpha_std against the informed tier's reach -- is
+    measured separately by `_interaction`; see README, Known limitations.
     """
+    if days < 1:
+        raise ValueError(f"days must be >= 1, got {days}")
     base = MarketParams()
     # The market cache only helps serially: handing 20k-step Market objects to a
     # worker process costs more than rebuilding them there. In parallel we let
@@ -145,7 +164,11 @@ def sweep(days: int = 10, out: str | None = "sweep.csv", quiet: bool = False,
         if not quiet:
             k = _key(_REF)
             t = row["tprev_" + k]          # vs the rung beneath: the honest one
-            star = "*" if abs(t) > 2.0 else " "
+            # The critical value depends on df. This used to hard-code 2.0,
+            # which at the shipped default (days=10, df=9 -> 2.262) starred
+            # rungs that flow_mm._report called not significant on the same
+            # contrast, and disagreed with `_interaction` in this same file.
+            star = "*" if abs(t) > t_crit95(days - 1) else " "
             print(f"  {tag:<16}{factors:<9}{row['predictable_share'] * 100:>6.1f}%"
                   f"{row['pnl_full']:>9,.0f}{row['pnl_best']:>9,.0f}"
                   f"{row['pnl_naive']:>9,.0f}{row['pnl_over_dd']:>7.1f}"
@@ -156,7 +179,8 @@ def sweep(days: int = 10, out: str | None = "sweep.csv", quiet: bool = False,
     if not quiet:
         print(f"\nSensitivity, {days} paired sessions per point. dPrev/tPrev/win are "
               f"the\n  '+ alpha signal' rung against the rung beneath it (no signal); "
-              f"* is |t| > 2.\n")
+              f"* is |t| above the\n  95% critical value for {days - 1} degrees of "
+              f"freedom, same as the backtest table.\n")
         print(f"  {'factor':<16}{'value':<9}{'pred%':>7}{'PnL full':>9}"
               f"{'PnL best':>9}{'PnL naive':>9}{'PnL/DD':>7}{'inf%':>7}"
               f"{'dPrev':>8}{'tPrev':>7}{'win':>6}{'':>3}")

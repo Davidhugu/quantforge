@@ -15,8 +15,13 @@ WHAT CHANGED AND WHY
      share, and "internal" had zero fee and zero impact -- so its reward was
      identically zero and epsilon-greedy converged to it on every seed while the
      un-filled residual silently dropped to "lit" at full cost. The reward is
-     now the whole-order cost of the bar, and internalisation is priced at the
-     concession you concede to the client rather than being free.
+     now the whole-order cost of the bar, which is what gives the bandit a real
+     decision even at the default concession: internal fills at most
+     `internal_cap` of the slice, and the rest of that slice re-prices at the lit
+     venue inside `bar_cost`, so a venue cannot look cheap merely by declining to
+     fill. Note that at the default `concession=0.0` an internal share really
+     does cost nothing, so the concession is what the parameter is for and there
+     is no CLI flag for it yet.
   4. O(B) schedule. The IS branch recomputed sum(exp(-k*j/B)) over the remaining
      bars inside the loop: O(B^2) ~ 46M math.exp calls for the study.
 """
@@ -167,6 +172,14 @@ def parent_order(algo: str, path: Path, rng, use_router: bool = False,
             tgt = rem * w[i] / W[i] * float(path.fc_clipped[i])
         tgt = rem if i == B - 1 else min(rem, tgt)
         if tgt <= 0:
+            # the bar still happened: the exogenous price moved through it, so
+            # px_exo must advance even though we traded nothing. `continue`
+            # without this desynchronises the marked price from path.dw for the
+            # rest of the order, and every later bar is then charged against a
+            # stale benchmark. Unreachable from the shipped schedules (w > 0
+            # and fc_clipped >= 0.5), but it is one line and the loop's
+            # invariant should not depend on the caller's weights.
+            px_exo += path.dw[i]
             continue
 
         v = router.pick() if router else "lit"
@@ -211,8 +224,16 @@ def _power_line(p, sd: float, n: int) -> str:
     "run a million paths".
     """
     delta = p["delta"]
-    need = int(np.ceil((2.0 * sd / abs(delta)) ** 2)) if delta else 0
-    if delta == 0.0 or need > 250_000:
+    # Compute in float and range-check before int(). Two separate overflows used
+    # to bite here: `x ** 2` raises OverflowError when x is finite but the square
+    # is not representable, and `int(inf)` raises too. A delta small enough to
+    # trip either is exactly the "indistinguishable from zero" case this line
+    # exists to report, so the guard crashed on the case it was written for.
+    # Multiplication saturates to inf where `**` raises.
+    ratio = 2.0 * sd / abs(delta) if (delta and math.isfinite(delta)) else math.inf
+    raw = ratio * ratio
+    need = int(math.ceil(raw)) if math.isfinite(raw) and raw < 1e18 else 0
+    if delta == 0.0 or not math.isfinite(delta) or need == 0 or need > 250_000:
         verdict = ("point estimate is indistinguishable from zero, so no "
                    "practical n resolves it")
         need_txt = f"n > {need:,}" if need else "n = inf"
@@ -259,7 +280,14 @@ def exec_demo(n: int = 3000, concession: float = 0.0, verbose: bool = True) -> d
     IS contrast properly needs an order of magnitude more paths, so pass
     --exec-n if you want the real number rather than the self-reported
     shortfall.
+
+    n must be at least 2. A single path carries no information about a mean
+    difference: it made every paired contrast come back t = +-inf and starred,
+    printed a confident report off one draw, and then died in the power block
+    because a per-path sd cannot be estimated from one observation.
     """
+    if n < 2:
+        raise ValueError(f"exec_demo() needs at least 2 common paths, got {n}")
     algos = ("TWAP", "VWAP", "IS-adaptive")
     res: dict[str, dict] = {}
     paths = [make_path(s) for s in range(n)]
@@ -329,8 +357,17 @@ def exec_demo(n: int = 3000, concession: float = 0.0, verbose: bool = True) -> d
     sd = float(np.std(np.asarray(base) - np.asarray(res[k_ref]["is_bps"]), ddof=1))
     print(_power_line(p_ref, sd=sd, n=len(base)))
 
+    # The fees are quoted here from SHAPE itself rather than transcribed, in bps
+    # of the arrival price. The literals are $/share -- they are added to a
+    # price in `parent_order` -- so a hard-coded "3.0 bp" read them as if they
+    # were already bps and overstated both by 100x. The run's own `fee` column
+    # is the reference: 0.3 bp lit, 0.1 bp dark.
+    lit_bps = Router.SHAPE["lit"][2] / ARRIVAL * 1e4
+    dark_bps = Router.SHAPE["dark"][2] / ARRIVAL * 1e4
     print(f"\n  CAVEAT on the router rows: Router.SHAPE *declares* dark cheaper than lit\n"
-          f"  (1.0 vs 3.0 bp fee, 0.2x vs 1.0x impact), so the gain is near-constant --\n"
+          f"  ({dark_bps:.1f} vs {lit_bps:.1f} bp fee, "
+          f"{Router.SHAPE['dark'][1]}x vs {Router.SHAPE['lit'][1]}x impact), so the "
+          f"gain is near-constant --\n"
           f"  per-path delta {dd.mean():+.2f} +/- {dd.std():.2f} bps. The very large t is a\n"
           f"  statement about that fee table, not a discovered edge: the bandit never had a\n"
           f"  real decision to make, and it will look impressive on any sample size.\n"

@@ -28,8 +28,13 @@ def summarize(x) -> dict:
     Everything is coerced to native Python types: callers pass numpy arrays and
     otherwise get numpy scalars back, which are not JSON-serialisable and make
     `result["sig"] is True` fail.
+
+    Raises on an empty series rather than returning zeros. The mean of nothing is
+    not zero, and a plausible-looking dict is worse than a loud failure.
     """
     n = len(x)
+    if not n:
+        raise ValueError("summarize() got an empty series")
     m = sum(x) / n
     if n < 2:
         return dict(n=n, mean=float(m), sem=0.0, lo=float(m), hi=float(m), sd=0.0)
@@ -41,17 +46,32 @@ def summarize(x) -> dict:
 
 
 def paired(x, y) -> dict:
-    """Statistics on the paired difference y - x (same seeds, same market paths)."""
+    """Statistics on the paired difference y - x (same seeds, same market paths).
+
+    Raises when the two series differ in length. `zip` would truncate silently
+    and then compute the critical value from the truncated length, so a rung
+    measured over a different number of sessions than the baseline would come
+    back as a confident answer to the wrong question.
+
+    A single observation is reported as t = 0 and not significant. One draw
+    cannot distinguish a real effect from one that happened to land, and
+    `sem = 0` used to turn it into t = +-inf, which is how a one-session run
+    ended up with every rung starred.
+    """
+    if len(x) != len(y):
+        raise ValueError(f"paired() needs equal-length series, got {len(x)} and {len(y)}")
     d = [float(b) - float(a) for a, b in zip(x, y)]
     s = summarize(d)
     s["delta"] = s["mean"]
-    s["win"] = float(sum(v > 0 for v in d) / len(d)) if d else 0.0
+    s["win"] = float(sum(v > 0 for v in d) / len(d))
     # t of the mean difference against zero; +/-inf when the difference is
-    # deterministic, which is itself the strongest possible result
-    if s["sem"] > 0:
+    # deterministic, which -- with n >= 2 -- is the strongest possible result
+    if s["n"] < 2:
+        s["t"] = 0.0
+    elif s["sem"] > 0:
         s["t"] = float(s["mean"] / s["sem"])
     else:
         s["t"] = math.copysign(math.inf, s["mean"]) if s["mean"] else 0.0
     s["t_p95"] = t_crit95(max(1, len(d) - 1))
-    s["sig"] = bool(abs(s["t"]) > s["t_p95"])
+    s["sig"] = bool(s["n"] >= 2 and abs(s["t"]) > s["t_p95"])
     return s
