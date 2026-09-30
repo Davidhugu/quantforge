@@ -45,6 +45,7 @@ import argparse
 import json
 import math
 import os
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field, replace
@@ -1030,11 +1031,78 @@ def _at_least(flag: str, minimum: int):
     return parse
 
 
+def _at_floats(flag: str, minimum: float, strict: bool = False):
+    """argparse `type` for a float bound, for flags where a bound is the point.
+
+    `--seconds -5` used to be accepted and simply record nothing while
+    reporting success; `--rotate-mb -1` was equally meaningless. Neither
+    library entry point caught them either, because the live source fails
+    first on a missing websocket dependency, so the user sees an unrelated
+    error instead of the argument that is actually wrong.
+    """
+    op = ">" if strict else ">="
+
+    def parse(v):
+        try:
+            n = float(v)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{flag} must be a number, got {v!r}")
+        bad = n <= minimum if strict else n < minimum
+        if bad:
+            raise argparse.ArgumentTypeError(f"{flag} must be {op} {minimum}, got {n}")
+        return n
+    return parse
+
+
+def _positive(flag: str):
+    return _at_floats(flag, 0.0, strict=True)
+
+
+def _nonneg(flag: str):
+    return _at_floats(flag, 0.0)
+
+
+def _depth():
+    """argparse `type` for the partial-book depth Binance actually serves.
+
+    The source checks the same set, but only after `websockets` has been
+    imported -- so `--depth 7` reported a missing dependency rather than the
+    bad flag, and would have reached the stream URL as an invalid depth
+    subscription, which Binance answers by closing the socket.
+    """
+    def parse(v):
+        try:
+            n = int(v)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"--depth must be an integer, got {v!r}")
+        if n not in (5, 10, 20):
+            raise argparse.ArgumentTypeError(
+                f"--depth must be 5, 10 or 20, got {n}")
+        return n
+    return parse
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(prog="quantforge",
                                  description=__doc__.split("\n")[1])
-    ap.add_argument("mode", choices=["backtest", "exec", "sweep", "all"], nargs="?",
-                    default="all")
+    ap.add_argument("mode", choices=["backtest", "exec", "sweep", "all", "record"],
+                    nargs="?", default="all")
+    ap.add_argument("--symbol", default="btcusdt",
+                    help="record: symbol to capture (default btcusdt)")
+    ap.add_argument("--futures-symbol", default=None,
+                    help="record: correlated instrument for the futures-lead "
+                         "feature (defaults to --symbol on fstream)")
+    ap.add_argument("--capture", default="data/capture.jsonl",
+                    help="record: output path for the merged JSONL capture")
+    ap.add_argument("--seconds", type=_positive("--seconds"), default=None,
+                    help="record: stop after this many seconds (default: run "
+                         "until interrupted). Must be > 0: a zero-length session "
+                         "records nothing and reports success")
+    ap.add_argument("--depth", type=_depth(), default=10,
+                    help="record: partial book depth, 5/10/20 (default 10)")
+    ap.add_argument("--rotate-mb", type=_nonneg("--rotate-mb"), default=0.0,
+                    help="record: roll to a new segment past this size, 0 = off")
     ap.add_argument("--days", type=_at_least("--days", 1), default=None,
                     help="paired sessions per config (backtest default 30, "
                          "sweep default 10). Takes precedence over --seeds. "
@@ -1065,6 +1133,36 @@ def main(argv=None) -> None:
                          "Negative is refused rather than folded into auto, "
                          "which is what a truthiness check would do with it.")
     a = ap.parse_args(argv)
+    if a.mode == "record":
+        # returns rather than falling through: recording blocks on a socket, so
+        # putting it in the `all` chain would put the three research modes
+        # behind a process that never exits on its own
+        from replay import ValidationError, record
+        try:
+            s = record(symbol=a.symbol, out=a.capture,
+                       futures_symbol=a.futures_symbol, seconds=a.seconds,
+                       depth=a.depth, rotate_mb=a.rotate_mb)
+        except ValidationError as e:
+            # the common case is a missing websocket client or a bad depth, and
+            # a four-frame traceback is not how this CLI reports a mistake
+            ap.exit(2, f"quantforge record: {e}\n")
+        print(f"captured {s['rows']} rows ({s['book']} book, "
+              f"{s['trades']} prints) across {s['segments']} segment(s), "
+              f"{s['anomalies']} anomalies")
+        # the row count is the only proof a socket produced anything, and a
+        # capture that stopped on a rotate boundary or never connected is
+        # otherwise indistinguishable from a quiet market
+        if s["rows"] == 0:
+            print("WARNING: no rows were captured. The stream connected but "
+                  "produced nothing, or never connected at all -- do not treat "
+                  "this file as a quiet market.", file=sys.stderr)
+        from replay import capture_is_continuous
+        if not capture_is_continuous(a.capture):
+            print(f"WARNING: {a.capture} holds more than one session, so it "
+                  f"was resumed or written by two recorders. The frames across "
+                  f"the seam span a gap; see sessions() in replay.record.",
+                  file=sys.stderr)
+        return
     if a.mode in ("backtest", "all"):
         from dataclasses import replace as _replace
         mp = MarketParams()

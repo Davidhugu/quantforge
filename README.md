@@ -45,15 +45,52 @@ python flow_mm.py sweep --days 10           # parameter sensitivity -> sweep.csv
 python flow_mm.py all                       # all three, in order
 ```
 
-Useful flags: `--workers N` (0 = auto, `cpu_count - 1`), `--alpha-std`,
+To go the other way — from the live market instead of a synthetic one:
+
+```bash
+pip install websockets                      # the only added dependency, live source only
+python flow_mm.py record --symbol btcusdt --seconds 3600 --capture data/btc.jsonl
+```
+
+```python
+from replay import capture_to_dataset, capture_is_continuous, sessions, ReplayMarket
+from flow_mm import LADDER, MarketParams, backtest
+
+ds = capture_to_dataset("data/btc.jsonl")   # merged capture -> one-second frames
+assert capture_is_continuous("data/btc.jsonl")   # one writer, no crash/restart seam
+backtest(days=1, markets=[ReplayMarket(ds, mp=MarketParams())], ladder=LADDER)
+```
+
+`record` writes the *merged capture* tier `readers` documents but had no producer
+for: book snapshots and prints interleaved in one time-ordered JSONL stream, at
+native frequency, which is the only tier that supports a real reachability check
+on fills. Read it back with `capture_to_dataset`, which derives its own
+one-second window from the file. It is a separate mode rather than part of `all`
+because it blocks on a socket.
+
+Recorder flags: `--seconds` (duration), `--depth` (5, 10, or 20 — the partial-book
+snapshot depth), `--rotate-mb` (roll to a new segment past a size, 0 = never),
+`--futures-symbol` to override the perp whose mid fills the `futures` column.
+`record` also streams a public futures `bookTicker` alongside spot, because the
+hedge layer needs a lead and a capture without one cannot replay a hedge
+faithfully — see limitation 15 for what it does instead.
+
+`capture_is_continuous` is the check to reach for before trusting a capture, and
+it is cheap: it reads only the sidecar, never the data file. A capture written by
+two processes returns `False`, and `sessions(path)` returns the `session_start`
+lines so you can see where the seam is. Neither one repairs the seam — a
+resumed capture has to be split before it is worth replaying (limitation 13).
+
+Other flags: `--workers N` (0 = auto, `cpu_count - 1`), `--alpha-std`,
 `--informed-rate` to override market calibration from the shell, `--exec-n` for
 path count, `--out` for the sweep CSV. Counts are validated at the parser, so
 `--days 0` or `--exec-n 1` is a one-line usage error rather than a run that
 quietly substitutes a default.
 
-`backtest` is the cheapest way in — a 1-day run takes about 8 seconds and a
-3-day run about 20 (seconds of wall clock, five rungs per session), and prints
-the full ladder with paired t-statistics.
+`backtest` is the cheapest way in — on the machine these numbers were measured
+on, a 1-day run takes about 6 seconds of wall clock and a 3-day run about 15
+(five rungs per session, 10 seeds), and prints the full ladder with paired
+t-statistics. `exec` is the slow one by design.
 
 ## The five layers
 
@@ -146,13 +183,42 @@ cancels.
 | `sweep.csv` | one row per grid point: PnL per rung, paired deltas/t/win/CI, fills, informed share, drawdown, PnL/DD. |
 | `audit_log.jsonl` | per-run event trail for the **last** rung of the ladder (`+ hedging (full)`) on seed 0 — fills, hedges, risk rejects (first, 100th, 1000th), throttle transitions, kill switch. Each record carries a real wall clock, a sim-time field, and the rung in `run`. The file is rewritten on each run, not appended to. |
 | `equity.png` | mean cumulative PnL path per rung. |
+| `<capture>.jsonl` | `record` output: one merged event per line, book columns and trade columns mutually exclusive via `null`. Strict JSON. Rotated into `<capture>.partNNNN.jsonl` once a segment passes `--rotate-mb`. |
+| `<capture>.meta.jsonl` | recorder diagnostics beside the capture — a `session_start` per writer, sequence gaps, stale streams, disconnects, and a `closed` line. Kept out of the capture so a gap can never be read as a quiet second. |
 
-A worked example of the latter two is committed under `baseline/`.
+The capture and its sidecar are two views of the same run, split by whether a
+line is market data or a claim about it. Two consecutive rows of a capture — one
+book, one print, the second half of the row `null`:
+
+```json
+{"ts_ms":1790763416817,"mid":100.0,"bid":99.9,"ask":100.1,"bid_qty":3.0,"ask_qty":4.0,"futures":null,"px":null,"qty":null,"side":null}
+{"ts_ms":1790763416917,"mid":null,"bid":null,"ask":null,"bid_qty":null,"ask_qty":null,"futures":null,"px":100.0,"qty":1.0,"side":1}
+```
+
+And the whole sidecar for that session, which is two lines long because nothing
+went wrong:
+
+```json
+{"kind":"session_start","wall":1790763416.714,"session":"1a0f1d13c89-29b6","pid":10678,"resumed":false,"prior_bytes":null,"venue":"binance:BTCUSDT","path":"…/btc.jsonl"}
+{"kind":"closed","venue":"binance:BTCUSDT","rows":22,"book":11,"trades":11,"anomalies":1,"segments":1,"session":"1a0f1d13c89-29b6","path":"…/btc.jsonl"}
+```
+
+The `session` id is the join key between them, and the absence of a diagnostic
+between the two is itself information: a sidecar that is only `session_start` and
+`closed` says the feed was clean for its whole length.
+
+These are real lines from a real capture, written against a stub socket rather
+than Binance (limitation 9), with only the `path` field elided. They are quoted
+here because they are illustrative, but deliberately not committed as *files*: a
+capture sitting in the repo is indistinguishable from live market data at a
+glance, and `data/` is gitignored for that reason. Regenerate one with `record`;
+the committed `baseline/` artifacts are the two from the ablation ladder, not a
+capture.
 
 ## Tests
 
 ```bash
-python -m pytest -q      # 102 tests, ~1 min
+python -m pytest -q      # 167 tests, ~1.5 min
 ```
 
 Coverage is behavioural rather than incidental: RLS against a closed-form least
@@ -173,6 +239,28 @@ interaction block reads both of its axes out of `GRID` instead of a private copy
 of them, so editing the grid cannot leave the cross term describing a grid that
 no longer exists.
 
+The recorder's own tests are named after the failure each one prevents, and a few
+of them exist because a green suite was not enough. The clearest case: both
+stream tasks used `while not True` to hold their receive loop open, which is
+`while False` — the recorder connected, wrote nothing, and reconnected as fast
+as the exchange accepted, reporting a clean zero-row session. Every other test
+drove the message handlers directly, so none of them could see it.
+
+The fix was to test above the handlers, not below them, and the suite now has
+two layers that do. A fake socket is driven in-process to assert the reconnect
+gap is non-zero. A stub `websockets` module, installed via `PYTHONPATH` in a
+subprocess, runs the real CLI end to end and asserts the things a handler-level
+test structurally cannot: that rows come out, that rotation reassembles through
+the reader, that the futures mid reaches every frame, that the sidecar stays
+silent when nothing is wrong, and that a zero-row or resumed capture is reported
+rather than returned as a success. The subprocess matters — `import websockets`
+happens inside the stream tasks, so a `sys.modules` patch in-process would leak
+into the tests that assert the missing-dependency path.
+
+Neither layer can confirm Binance's field names. That is what limitation 9 is
+for, and it is why the stub is described there as a stub rather than a test of
+the wire format.
+
 ## Project layout
 
 ```
@@ -180,8 +268,17 @@ flow_mm.py      market, signals, quoting, hedging, risk, backtest, CLI  (entry p
 exec_algos.py   execution schedules + venue router
 analysis.py     sensitivity sweep and the interaction block
 stats.py        paired statistics, no scipy
+replay/         run the harness on recorded data instead of a synthetic market
+  schema.py       canonical frame/trade tables; a new venue is a missing reader
+  readers.py      capture and archive readers, capture_to_dataset
+  store.py        Dataset, and the event->one-second resampler
+  market.py       ReplayMarket: a recording presented as a Market lookalike
+  record.py       live capture: CaptureWriter, BinanceSource, session helpers
+  fixtures.py     hermetic test sessions, deliberately including the bad cases
 tests/          pytest suite
+baseline/       committed ablation artifacts (audit_log.jsonl, equity.png)
 ```
+
 ## Known limitations
 
 The code refers back to this section; these are not hedges, they are the
@@ -212,17 +309,84 @@ boundary of what the harness measures.
 7. **Only the calibrated regime measures anything.** `alpha_std` is set so ~20%
    of 30-second return variance is predictable. Outside that regime the signal
    and adverse-selection layers are unmeasurable and the ladder reports noise.
-8. **Paired t-statistics are within-path.** Seeds are shared across rungs, so the
+8. **The quoting layer is calibrated to a ~$100 price level.** The
+   Avellaneda-Stoikov half-spread is `_vterm * var + _kterm`, and `var` is a
+   per-second variance in dollars squared while `_kterm` is a fixed dollar
+   constant. Both are absolute, so the spread does not survive a change of
+   instrument: in basis points the variance term grows *linearly with price* and
+   the constant term shrinks inversely. At $100 the spread lands near 1bp, which
+   is why the ladder looks sane; on a $64,000 instrument the same relative
+   volatility quotes ~100bp wide, every quote falls outside a 3bp book, and the
+   day returns zero fills and zero PnL. That zero is the correct answer for a
+   strategy quoting that wide — what is not acceptable is that it reads like a
+   strategy that found no edge, so it is pinned as a test
+   (`test_a_price_level_the_quoting_layer_was_not_calibrated_for_fills_nothing`).
+   Making the spread dimensionless is a prerequisite for trading anything that
+   is not a ~$100 share, and it will move every number in `baseline/`.
+9. **`record` trades nothing and cannot.** `BinanceSource` subscribes to public
+   market data only; there is no authenticated endpoint anywhere in the project.
+   It has also never been run against Binance: `websockets` is not installed
+   here, so the message mapping and the reconnect behaviour are covered by fakes
+   and by a stub socket, not by the real wire. A stub confirms the loop, the
+   rotation, the futures carry-forward and the reader round trip; it cannot
+   confirm the field names, and a stream rename would surface as a zero-row
+   capture rather than an error. `record` now warns on a zero-row capture and on
+   a resumed one, but check the `closed` line's count before trusting any file.
+   A capture-only tool is what makes the sequencing survivable — capture, replay,
+   paper, then live — since a reconnect bug cannot cost money while the
+   recorder is incapable of sending an order.
+10. **A capture is a partial-book snapshot stream, so it has no queue.** `@depthN`
+   sends absolute top-N, not deltas, which is why a reconnect is self-healing:
+   the book is correct the instant the stream opens and no venue backfills. The
+   cost is that queue position is still unobserved, exactly as limitation 1 says
+   for the synthetic market.
+11. **Paired t-statistics are within-path.** Seeds are shared across rungs, so the
    tests describe this synthetic market, not a population of real ones. No
    parameter uncertainty is propagated into the intervals.
-9. **`adverse` is a memo line, not a PnL term.** It is the 30-second move in the
-   mid after each fill, signed so positive means the market went against us. It
-   is the *negation* of the per-fill contribution to `inv_drift` and the
-   sign-flip of the markout (per fill `mo == spread_c - adverse_c`), and is
-   excluded from the additive decomposition to avoid double counting. Note the
-   units differ: `spread` and `adverse` are dollars, `mo_b`/`mo_i` are basis
-   points per share. It is also computed and aggregated but never printed or
-   written, so it is currently a dead diagnostic.
+12. **`adverse` is a memo line, not a PnL term.** It is the 30-second move in the
+    mid after each fill, signed so positive means the market went against us. It
+    is the *negation* of the per-fill contribution to `inv_drift` and the
+    sign-flip of the markout (per fill `mo == spread_c - adverse_c`), and is
+    excluded from the additive decomposition to avoid double counting. Note the
+    units differ: `spread` and `adverse` are dollars, `mo_b`/`mo_i` are basis
+    points per share. It is also computed and aggregated but never printed or
+    written, so it is currently a dead diagnostic.
+13. **A resumed recording is detectable but not repaired.** Each writer stamps a
+    `session_start` line into the sidecar with a per-process id and a `resumed`
+    flag, so `sessions(path)` and `capture_is_continuous(path)` will tell you a
+    capture was written by two runs, and `record` prints a warning. What that
+    buys is knowledge, not a fix: the rows on both sides are still one flat
+    timeline, and `resample` forward-fills the gap between them into seconds that
+    are flagged `stale` but otherwise indistinguishable from a quiet market. A
+    capture with two sessions has to be split before it is worth replaying. The
+    marker lives in the sidecar rather than the data file precisely so that
+    splitting it needs no format change.
+14. **An out-of-order row is written, not resorted — the sidecar is the only
+    record.** A backwards `ts_ms` (NTP correction, or a reconnect after the
+    exchange and the local clock disagree) still gets written, because refusing
+    it would lose a real print, but `resample` buckets by second and will assign
+    it to the earlier one, building a frame from two events the venue never put
+    in the same second. The writer notes this as `out_of_order`, once per
+    excursion, and that note is the only trace: `capture_to_dataset` does not
+    consult it, so a replay built from such a capture looks entirely normal. The
+    check is on the second, not the millisecond, because that is what the
+    resampler buckets on — the two streams interleave inside a second routinely
+    and flagging that would train you to ignore the sidecar. If a capture has an
+    `out_of_order` note, treat the affected second as suspect.
+15. **A capture with no futures feed replays as if the lead were exactly zero.**
+    `resample` substitutes the spot `mid` wherever `futures` is missing or
+    non-finite (`store.py`, `fut = np.where(np.isfinite(fut), fut, mid)`), so a
+    capture recorded without a futures stream — or one whose futures stream
+    died — produces frames whose futures lead is identically zero rather than
+    absent. The choice is deliberate: a NaN would propagate into the RLS and
+    poison every downstream rung with a non-finite input, and a zero lead is at
+    least a real number. But the cost is that a dead futures feed is
+    indistinguishable in the replay from a perp that tracked spot exactly, which
+    is not a market that exists. Nothing warns about it: the writer's
+    `futures_stale` note lands in the sidecar and `capture_to_dataset` does not
+    read it, exactly as in limitation 14. If a capture has a `futures_stale`
+    note, the hedge layer in that replay is fiction, and the `+ hedging (full)`
+    rung should not be read as a result.
 
 ## License
 

@@ -42,9 +42,15 @@ def synth_session(seed: int = 0, seconds: int = 900, start_ms: int = 1_757_000_0
     sigma = annual_vol / np.sqrt(365.0 * 86400.0)
     drift = np.zeros(seconds)
     n_bursts = max(1, seconds // 300)
+    # The burst window has to fit inside the session. `integers(0, seconds - 30)`
+    # raised "high <= 0" for any session under 31 seconds, so a short capture --
+    # exactly what `capture_to_dataset` produces from a brief recording -- could
+    # not be turned into a fixture at all. Above ~60 seconds this is the
+    # original arithmetic unchanged, so the pinned volatility tests do not move.
+    span = min(30, max(1, seconds // 4))
     for _ in range(n_bursts):
-        s = int(rng.integers(0, seconds - 30))
-        drift[s:s + 30] = rng.normal(0, 6 * sigma)
+        s = int(rng.integers(0, max(1, seconds - span)))
+        drift[s:s + span] = rng.normal(0, 6 * sigma)
     step = rng.normal(0, sigma, seconds) + drift
     mid = px0 * np.exp(np.cumsum(step))
 

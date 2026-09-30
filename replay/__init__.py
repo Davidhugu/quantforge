@@ -21,19 +21,36 @@ Typical use:
 
     ds = load("btcusdt-2026-09-28.npz")
     backtest(markets=[ReplayMarket(ds)], ladder=LADDER)
+
+To get `ds` from the live market rather than the bulk archive, record a session
+first -- see `record`, which writes the merged capture `readers` already parses:
+
+    record("btcusdt", out="data/btcusdt.jsonl", seconds=3600)
+    ds = capture_to_dataset("data/btcusdt.jsonl")
 """
 from .market import FillModel, ReplayMarket
+from .record import (CaptureWriter, capture_is_continuous, read_sidecar,
+                     record, sessions)
+from .readers import capture_to_dataset, from_binance_trades, read_events
 from .schema import FRAME_COLUMNS, TRADE_COLUMNS, ValidationError
 from .store import Dataset, load, resample, save
 
 __all__ = [
+    "CaptureWriter",
     "Dataset",
     "FillModel",
     "FRAME_COLUMNS",
     "ReplayMarket",
     "TRADE_COLUMNS",
     "ValidationError",
+    "capture_is_continuous",
+    "capture_to_dataset",
+    "from_binance_trades",
     "load",
+    "read_events",
+    "read_sidecar",
+    "record",
     "resample",
     "save",
+    "sessions",
 ]

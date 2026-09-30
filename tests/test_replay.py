@@ -18,6 +18,8 @@ during its first hour, which is the only justification for its existence:
 That last one is the dangerous class. It produced a result that read as a
 finding about the strategy and was a bug in the fixture.
 """
+import json
+
 import numpy as np
 import pytest
 
@@ -104,9 +106,18 @@ def test_a_print_after_the_books_close_lands_in_the_next_second():
     """The frame clock is the boundary; a late print must not leak backwards."""
     ev = _stream(3)
     ev["px"] = list(ev["px"]) + [100.02, 101.02]
-    ev["ts_ms"] = np.append(ev["ts_ms"], 1_000_900, 1_001_999)
-    for k in ("mid", "bid", "ask", "bid_qty", "ask_qty", "qty", "side"):
+    # `np.append` takes a single extra value, not two: passing two scalars made
+    # it nest them into one object array and the failure surfaced as an
+    # out-of-bounds axis rather than as the malformed call it was
+    ev["ts_ms"] = np.append(ev["ts_ms"], [1_000_900, 1_001_999])
+    # The two prints need a real qty and side. Padding those with NaN as the
+    # book columns are padded made `resample` cast NaN to int8, and the NaN
+    # became 0 -- a print with aggressor side 0, which `validate` correctly
+    # rejects. The column padding applies to the *other* columns.
+    for k in ("mid", "bid", "ask", "bid_qty", "ask_qty"):
         ev[k] = list(ev[k]) + [np.nan, np.nan]
+    ev["qty"] = list(ev["qty"]) + [1.0, 1.0]
+    ev["side"] = list(ev["side"]) + [1, -1]
     ds = resample(ev, 1_000_000, 3)
     by_sec = [ds.trades_in_second(i) for i in range(3)]
     assert [len(x) for x in by_sec] == [1, 1, 0]
@@ -171,6 +182,46 @@ def test_npz_round_trip_is_lossless(tmp_path):
         assert np.allclose(back.trades[k], ds.trades[k]), k
 
 
+# ------------------------------------------------------------- capture venue
+
+def test_a_capture_keeps_the_venue_the_recorder_recorded(tmp_path):
+    """The filename is not the venue, and the reader used to conflate them.
+
+    `capture_to_dataset` overwrote the venue with the file's stem, so a capture
+    written by `record` -- which knows it was talking to `binance:BTCUSDT` and
+    says so in the sidecar -- came back labelled `btc`, which is a symbol. On a
+    single-venue setup that reads like cosmetics; the moment two venues share a
+    ticker it merges two different books under one label, silently. Found by
+    the live smoke test.
+    """
+    from replay import CaptureWriter, capture_to_dataset
+    p = tmp_path / "btc.jsonl"
+    t0 = 1_700_000_000_000
+    with CaptureWriter(str(p), venue="binance:BTCUSDT") as w:
+        for k in range(5):
+            w.book(t0 + k * 1_000, 99.95, 100.05, 10.0, 12.0)
+    assert capture_to_dataset(str(p)).meta["venue"] == "binance:BTCUSDT"
+    # an explicit argument still wins, for a caller who knows better
+    assert capture_to_dataset(str(p), venue="kraken").meta["venue"] == "kraken"
+
+
+def test_a_capture_with_no_recorder_sidecar_still_falls_back_to_the_filename(tmp_path):
+    """The venue lookup must not become a hard dependency on a sidecar.
+
+    A capture from any other source has none, and refusing to read it -- or
+    labelling it `None` -- would be a regression in exchange for the fix above.
+    """
+    from replay import capture_to_dataset
+    p = tmp_path / "ethusdt.jsonl"
+    with open(p, "w") as fh:
+        for k in range(5):
+            fh.write(json.dumps({
+                "ts_ms": 1_700_000_000_000 + k * 1_000, "mid": 2000.0,
+                "bid": 1999.0, "ask": 2001.0, "bid_qty": 1.0, "ask_qty": 1.0,
+                "futures": None, "px": None, "qty": None, "side": None}) + "\n")
+    assert capture_to_dataset(str(p)).meta["venue"] == "ethusdt"
+
+
 # ---------------------------------------------------------------- ReplayMarket
 
 def test_replay_market_satisfies_the_engine_interface():
@@ -190,7 +241,12 @@ def test_imbalance_is_derived_from_the_book_not_injected():
     m = ReplayMarket(ds, mp=MarketParams(steps=ds.n_seconds))
     f = ds.frames
     raw = (f["bid_qty"] - f["ask_qty"]) / (f["bid_qty"] + f["ask_qty"])
-    got = m.Il[1:len(raw) + 1]
+    # `Il` is a plain list, so boolean-mask indexing needs an array first. It is
+    # aligned to frames positionally -- `Il[t]` is frame `t`, with one extra
+    # repeated element at the end -- so this is a prefix, not a shift. Slicing
+    # from 1 compared every frame against its neighbour, and the "is this a pure
+    # function" assertion then failed on data that was in fact fine.
+    got = np.asarray(m.Il[:len(raw)])
     # a fixed rescaling of the book imbalance, not an injected latent state:
     # the ratio must be the same constant at every second
     nz = raw != 0
